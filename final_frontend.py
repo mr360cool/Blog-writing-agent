@@ -168,7 +168,9 @@ def render_markdown_with_local_images(md: str):
 # -----------------------------------------------------------------------------
 def list_past_blogs() -> List[Path]:
     cwd = Path(".")
-    files = [p for p in cwd.glob("*.md") if p.is_file()]
+    files = [
+        p for p in cwd.glob("*.md") if p.is_file() and p.name.lower() != "readme.md"
+    ]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return files
 
