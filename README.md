@@ -1,5 +1,7 @@
 # 🚀 Autonomous Multi-Agent Blog Engine (LangGraph + Human-in-the-Loop)
 
+[![Open the live app](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blog-writing-agent-wypxaavtobakyamcxfhqzz.streamlit.app/)
+
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
 [![Streamlit](https://img.shields.io/badge/Frontend-Streamlit-red.svg)](https://streamlit.io/)
