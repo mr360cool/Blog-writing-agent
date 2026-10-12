@@ -1,0 +1,727 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import uuid
+import zipfile
+from datetime import date
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+import pandas as pd
+import streamlit as st
+
+
+def _load_streamlit_secrets() -> None:
+    """Expose configured Streamlit secrets to integrations that read environment variables."""
+    from streamlit.errors import StreamlitSecretNotFoundError
+
+    try:
+        secrets = st.secrets
+    except StreamlitSecretNotFoundError:
+        return
+
+    for key in (
+        "OPENAI_API_KEY",
+        "TAVILY_API_KEY",
+        "BLOG_AGENT_MODEL",
+        "BLOG_AGENT_DB_URI",
+        "BLOG_AGENT_DB_CONNECT_TIMEOUT",
+        "LANGSMITH_TRACING",
+        "LANGSMITH_ENDPOINT",
+        "LANGSMITH_API_KEY",
+        "LANGSMITH_PROJECT",
+    ):
+        if key in secrets and key not in os.environ:
+            os.environ[key] = str(secrets[key])
+
+
+_load_streamlit_secrets()
+
+from final_backend import app, Task, Plan
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def safe_slug(title: str) -> str:
+    s = title.strip().lower()
+    s = re.sub(r"[^a-z0-9 _-]+", "", s)
+    s = re.sub(r"\s+", "_", s).strip("_")
+    return s or "blog"
+
+
+def bundle_zip(md_text: str, md_filename: str, images_dir: Path) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr(md_filename, md_text.encode("utf-8"))
+        if images_dir.exists() and images_dir.is_dir():
+            for p in images_dir.rglob("*"):
+                if p.is_file():
+                    z.write(p, arcname=str(p))
+    return buf.getvalue()
+
+
+def images_zip(images_dir: Path) -> Optional[bytes]:
+    if not images_dir.exists() or not images_dir.is_dir():
+        return None
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for p in images_dir.rglob("*"):
+            if p.is_file():
+                z.write(p, arcname=str(p))
+    return buf.getvalue()
+
+
+def try_stream(
+    graph_app, inputs: Optional[Dict[str, Any]], config: dict
+) -> Iterator[Tuple[str, Any]]:
+    """Stream graph updates without silently re-running a failed workflow."""
+    for step in graph_app.stream(inputs, config, stream_mode="updates"):
+        yield ("updates", step)
+
+
+def extract_latest_state(
+    current_state: Dict[str, Any], step_payload: Any
+) -> Dict[str, Any]:
+    if isinstance(step_payload, dict):
+        if len(step_payload) == 1 and isinstance(
+            next(iter(step_payload.values())), dict
+        ):
+            inner = next(iter(step_payload.values()))
+            current_state.update(inner)
+        else:
+            current_state.update(step_payload)
+    return current_state
+
+
+# -----------------------------------------------------------------------------
+# Markdown renderer that supports local images
+# -----------------------------------------------------------------------------
+_MD_IMG_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)")
+_CAPTION_LINE_RE = re.compile(r"^\*(?P<cap>.+)\*$")
+
+
+def _resolve_image_path(src: str) -> Path:
+    src = src.strip().lstrip("./")
+    return Path(src).resolve()
+
+
+def render_markdown_with_local_images(md: str):
+    matches = list(_MD_IMG_RE.finditer(md))
+    if not matches:
+        st.markdown(md, unsafe_allow_html=False)
+        return
+
+    parts: List[Tuple[str, str]] = []
+    last = 0
+    for m in matches:
+        before = md[last : m.start()]
+        if before:
+            parts.append(("md", before))
+        alt = (m.group("alt") or "").strip()
+        src = (m.group("src") or "").strip()
+        parts.append(("img", f"{alt}|||{src}"))
+        last = m.end()
+
+    tail = md[last:]
+    if tail:
+        parts.append(("md", tail))
+
+    i = 0
+    while i < len(parts):
+        kind, payload = parts[i]
+        if kind == "md":
+            st.markdown(payload, unsafe_allow_html=False)
+            i += 1
+            continue
+
+        alt, src = payload.split("|||", 1)
+        caption = None
+        if i + 1 < len(parts) and parts[i + 1][0] == "md":
+            nxt = parts[i + 1][1].lstrip()
+            if nxt.strip():
+                first_line = nxt.splitlines()[0].strip()
+                mcap = _CAPTION_LINE_RE.match(first_line)
+                if mcap:
+                    caption = mcap.group("cap").strip()
+                    rest = "\n".join(nxt.splitlines()[1:])
+                    parts[i + 1] = ("md", rest)
+
+        if src.startswith("http://") or src.startswith("https://"):
+            st.image(src, caption=caption or (alt or None), width="stretch")
+        else:
+            img_path = _resolve_image_path(src)
+            if img_path.exists():
+                st.image(
+                    str(img_path), caption=caption or (alt or None), width="stretch"
+                )
+            else:
+                st.warning(f"Image not found: `{src}` (looked for `{img_path}`)")
+        i += 1
+
+
+# -----------------------------------------------------------------------------
+# Past blogs helpers
+# -----------------------------------------------------------------------------
+def list_past_blogs() -> List[Path]:
+    cwd = Path(".")
+    files = [p for p in cwd.glob("*.md") if p.is_file()]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files
+
+
+def read_md_file(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def extract_title_from_md(md: str, fallback: str) -> str:
+    for line in md.splitlines():
+        if line.startswith("# "):
+            t = line[2:].strip()
+            return t or fallback
+    return fallback
+
+
+# -----------------------------------------------------------------------------
+# Streamlit UI
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="LangGraph Blog Writer", layout="wide")
+st.title("Blog Writing Agent")
+
+if "workflow_status" not in st.session_state:
+    st.session_state.workflow_status = "idle"
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+if "run_id" not in st.session_state:
+    st.session_state.run_id = str(uuid.uuid4())
+if "logs" not in st.session_state:
+    st.session_state["logs"] = []
+if "last_out" not in st.session_state:
+    st.session_state["last_out"] = None
+if "current_state" not in st.session_state:
+    st.session_state["current_state"] = {}
+
+logs = st.session_state["logs"]
+
+
+def log(msg: str):
+    logs.append(msg)
+
+
+# LangSmith status badge
+with st.sidebar:
+    st.header("Generate New Blog")
+    topic = st.text_area("Topic", height=120)
+    as_of = st.date_input("As-of date", value=date.today())
+    run_btn = st.button("🚀 Generate Blog", type="primary")
+
+    st.divider()
+    tracing_enabled = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
+    st.caption(
+        f"LangSmith tracing: {'✅ enabled' if tracing_enabled else '⚪ disabled'}"
+    )
+
+    st.divider()
+    st.subheader("Past blogs")
+
+    past_files = list_past_blogs()
+    if not past_files:
+        st.caption("No saved blogs found (*.md in current folder).")
+        selected_md_file = None
+    else:
+        options: List[str] = []
+        file_by_label: Dict[str, Path] = {}
+        for p in past_files[:50]:
+            try:
+                md_text = read_md_file(p)
+                title = extract_title_from_md(md_text, p.stem)
+            except Exception:
+                title = p.stem
+            label = f"{title}  ·  {p.name}"
+            options.append(label)
+            file_by_label[label] = p
+
+        selected_label = st.radio(
+            "Select a blog to load",
+            options=options,
+            index=0,
+            label_visibility="collapsed",
+        )
+        selected_md_file = file_by_label.get(selected_label)
+
+        if st.button("📂 Load selected blog"):
+            if selected_md_file:
+                md_text = read_md_file(selected_md_file)
+                st.session_state["last_out"] = {
+                    "plan": None,
+                    "evidence": [],
+                    "image_specs": [],
+                    "fact_check_report": {},
+                    "citation_coverage": None,
+                    "groundedness_score": None,
+                    "evaluation": {},
+                    "errors": [],
+                    "final": md_text,
+                }
+                st.session_state["topic_prefill"] = extract_title_from_md(
+                    md_text, selected_md_file.stem
+                )
+                st.session_state.workflow_status = "idle"
+
+
+# Different tabs
+tab_plan, tab_evidence, tab_quality, tab_preview, tab_images, tab_logs = st.tabs(
+    [
+        "🧩 Plan",
+        "🔎 Evidence",
+        "🛡️ Quality & Evaluation",
+        "📝 Markdown Preview",
+        "🖼️ Images",
+        "🧾 Logs",
+    ]
+)
+
+
+# -----------------------------------------------------------------------------
+# Graph Execution Logic with Pauses
+# -----------------------------------------------------------------------------
+config = {
+    "configurable": {"thread_id": st.session_state.thread_id},
+    "run_name": "blog_generation",
+    "tags": ["blog-writing-agent", "langgraph", "content-generation"],
+    "metadata": {
+        "run_id": st.session_state.run_id,
+        "topic": topic.strip()[:500] if isinstance(topic, str) else "",
+    },
+}
+
+if run_btn:
+    if not topic.strip():
+        st.warning("Please enter a topic.")
+        st.stop()
+
+    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.run_id = str(uuid.uuid4())
+    config = {
+        "configurable": {"thread_id": st.session_state.thread_id},
+        "run_name": "blog_generation",
+        "tags": ["blog-writing-agent", "langgraph", "content-generation"],
+        "metadata": {
+            "run_id": st.session_state.run_id,
+            "topic": topic.strip()[:500],
+        },
+    }
+    st.session_state.workflow_status = "running"
+    st.session_state.inputs = {
+        "run_id": st.session_state.run_id,
+        "topic": topic.strip(),
+        "mode": "",
+        "needs_research": False,
+        "queries": [],
+        "evidence": [],
+        "plan": None,
+        "as_of": as_of.isoformat(),
+        "recency_days": 7,
+        "sections": [],
+        "merged_md": "",
+        "md_with_placeholders": "",
+        "image_specs": [],
+        "fact_check_report": {},
+        "citation_coverage": None,
+        "groundedness_score": None,
+        "unsupported_claim_rate": None,
+        "invalid_citation_count": 0,
+        "evaluation": {},
+        "errors": [],
+        "final": "",
+    }
+    st.session_state.current_state = {}
+    st.session_state["logs"] = []
+
+
+if st.session_state.workflow_status in ["running", "resuming"]:
+    inputs_to_pass = (
+        st.session_state.inputs
+        if st.session_state.workflow_status == "running"
+        else None
+    )
+
+    status = st.status("Running graph…", expanded=True)
+    progress_area = st.empty()
+    last_node = None
+
+    try:
+        for kind, payload in try_stream(app, inputs_to_pass, config):
+            if kind in ("updates", "values"):
+                node_name = None
+                if (
+                    isinstance(payload, dict)
+                    and len(payload) == 1
+                    and isinstance(next(iter(payload.values())), dict)
+                ):
+                    node_name = next(iter(payload.keys()))
+                if node_name and node_name != last_node:
+                    status.write(f"➡️ Node: `{node_name}`")
+                    last_node = node_name
+
+                st.session_state.current_state = extract_latest_state(
+                    st.session_state.current_state, payload
+                )
+
+                evaluation = st.session_state.current_state.get("evaluation") or {}
+                summary = {
+                    "mode": st.session_state.current_state.get("mode"),
+                    "needs_research": st.session_state.current_state.get(
+                        "needs_research"
+                    ),
+                    "queries": (
+                        st.session_state.current_state.get("queries", [])[:5]
+                        if isinstance(
+                            st.session_state.current_state.get("queries"), list
+                        )
+                        else []
+                    ),
+                    "evidence_count": len(
+                        st.session_state.current_state.get("evidence", []) or []
+                    ),
+                    "tasks": (
+                        len(
+                            (st.session_state.current_state.get("plan") or {}).get(
+                                "tasks", []
+                            )
+                        )
+                        if isinstance(st.session_state.current_state.get("plan"), dict)
+                        else None
+                    ),
+                    "images": len(
+                        st.session_state.current_state.get("image_specs", []) or []
+                    ),
+                    "sections_done": len(
+                        st.session_state.current_state.get("sections", []) or []
+                    ),
+                    "revisions_done": st.session_state.current_state.get(
+                        "revision_count", 0
+                    ),
+                    "citation_coverage": st.session_state.current_state.get(
+                        "citation_coverage"
+                    ),
+                    "groundedness": st.session_state.current_state.get(
+                        "groundedness_score"
+                    ),
+                    "quality_score": evaluation.get("overall_quality_score"),
+                    "errors": len(
+                        st.session_state.current_state.get("errors", []) or []
+                    ),
+                }
+                progress_area.json(summary)
+                log(f"[{kind}] {json.dumps(payload, default=str)[:1800]}")
+    except Exception as exc:  # noqa: BLE001
+        st.session_state.workflow_status = "failed"
+        log(f"[graph_error] {type(exc).__name__}: {exc}")
+        status.update(label="❌ Graph failed", state="error", expanded=True)
+        st.error(
+            "The workflow failed. Check the Logs tab for the exact error. "
+            "Your PostgreSQL checkpoint remains available for the thread."
+        )
+    else:
+        current_graph_state = app.get_state(config)
+        if current_graph_state.next:
+            st.session_state.workflow_status = "pending_approval"
+            st.rerun()
+        else:
+            st.session_state.workflow_status = "completed"
+            st.session_state["last_out"] = current_graph_state.values
+            status.update(label="✅ Done", state="complete", expanded=False)
+            st.rerun()
+
+
+# -----------------------------------------------------------------------------
+# Human-in-the-loop Plan Approval
+# -----------------------------------------------------------------------------
+if st.session_state.workflow_status == "pending_approval":
+    st.warning("⏸️ Agent Paused: Human-in-the-Loop Plan Approval")
+    current_graph_state = app.get_state(config)
+    plan_dict = current_graph_state.values.get("plan")
+
+    if plan_dict:
+        st.subheader("Edit Outline / Task Definitions")
+        st.markdown(
+            "Modify the titles, goals, and target word counts below. When satisfied, "
+            "click **Approve** to fan-out to the worker nodes."
+        )
+
+        tasks = plan_dict.get("tasks", [])
+        df = pd.DataFrame(tasks)
+        edited_df = st.data_editor(df, width="stretch", disabled=["id"])
+
+        if st.button("✅ Approve Plan & Continue Generating", type="primary"):
+            try:
+                updated_tasks = edited_df.to_dict("records")
+                # Re-validate human edits against the original schema before resuming.
+                validated_tasks = [
+                    Task.model_validate(t).model_dump() for t in updated_tasks
+                ]
+                plan_dict["tasks"] = validated_tasks
+                validated_plan = Plan.model_validate(plan_dict).model_dump()
+                app.update_state(config, {"plan": validated_plan})
+                st.session_state.workflow_status = "resuming"
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Plan validation failed: {exc}")
+
+
+# -----------------------------------------------------------------------------
+# Results Dashboard
+# -----------------------------------------------------------------------------
+if st.session_state.workflow_status in ["idle", "completed", "failed"]:
+    if st.session_state.workflow_status == "failed":
+        out = st.session_state.get("current_state") or st.session_state.get("last_out")
+    else:
+        out = st.session_state.get("last_out") or st.session_state.get("current_state")
+    if out:
+        # --- Plan tab ---
+        with tab_plan:
+            st.subheader("Plan")
+            plan_dict = out.get("plan")
+            if not plan_dict:
+                st.info("No plan found in output.")
+            else:
+                st.write("**Title:**", plan_dict.get("blog_title"))
+                cols = st.columns(3)
+                cols[0].write("**Audience:** " + str(plan_dict.get("audience")))
+                cols[1].write("**Tone:** " + str(plan_dict.get("tone")))
+                cols[2].write("**Blog kind:** " + str(plan_dict.get("blog_kind", "")))
+
+                tasks = plan_dict.get("tasks", [])
+                if tasks:
+                    df = pd.DataFrame(
+                        [
+                            {
+                                "id": t.get("id"),
+                                "title": t.get("title"),
+                                "target_words": t.get("target_words"),
+                                "requires_research": t.get("requires_research"),
+                                "requires_citations": t.get("requires_citations"),
+                                "requires_code": t.get("requires_code"),
+                                "tags": ", ".join(t.get("tags") or []),
+                            }
+                            for t in tasks
+                        ]
+                    ).sort_values("id")
+                    st.dataframe(df, width="stretch", hide_index=True)
+                    with st.expander("Task details"):
+                        st.json(tasks)
+
+        # --- Evidence tab ---
+        with tab_evidence:
+            st.subheader("Evidence")
+            evidence = out.get("evidence") or []
+            if not evidence:
+                st.info(
+                    "No evidence returned. The topic may be closed-book, research may have failed, "
+                    "or TAVILY_API_KEY may be missing."
+                )
+            else:
+                rows = []
+                for e in evidence:
+                    rows.append(
+                        {
+                            "id": e.get("id"),
+                            "title": e.get("title"),
+                            "published_at": e.get("published_at"),
+                            "source": e.get("source"),
+                            "url": e.get("url"),
+                            "credibility": e.get("credibility_score"),
+                            "excerpt": (e.get("snippet") or "")[:250],
+                        }
+                    )
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                with st.expander("Full source evidence"):
+                    for e in evidence:
+                        st.markdown(f"### [{e.get('id')}] {e.get('title')}")
+                        st.caption(
+                            f"{e.get('source') or 'Unknown source'} · {e.get('published_at') or 'date unknown'}"
+                        )
+                        st.write(e.get("snippet") or "")
+                        st.link_button("Open source", e.get("url") or "#")
+
+        # --- Quality / Evaluation tab ---
+        with tab_quality:
+            st.subheader("Quality, Grounding & Evaluation")
+
+            evaluation = out.get("evaluation") or {}
+            fc = out.get("fact_check_report") or {}
+            summary = fc.get("summary") or {}
+
+            q_score = evaluation.get("overall_quality_score")
+            ground_val = evaluation.get(
+                "groundedness_score", out.get("groundedness_score")
+            )
+            cite_val = evaluation.get(
+                "citation_coverage_score", out.get("citation_coverage")
+            )
+            sec_val = evaluation.get("section_coverage_score")
+
+            if q_score is not None and float(q_score) >= 75:
+                st.success(
+                    f"🎯 **Target Achieved! Overall Quality: {q_score}/100** — Blog meets all rigorous quality, groundedness, and adherence criteria."
+                )
+            elif q_score is not None:
+                st.info(f"📊 **Overall Quality: {q_score}/100**")
+
+            metric_cols = st.columns(5)
+            metric_cols[0].metric(
+                "Overall Quality",
+                f"{q_score}/100" if q_score is not None else "N/A",
+            )
+            metric_cols[1].metric(
+                "Groundedness",
+                f"{ground_val}%" if ground_val is not None else "N/A",
+            )
+            metric_cols[2].metric(
+                "Citation Coverage",
+                f"{cite_val}%" if cite_val is not None else "N/A",
+            )
+            metric_cols[3].metric(
+                "Section Coverage",
+                f"{sec_val}%" if sec_val is not None else "N/A",
+            )
+            metric_cols[4].metric(
+                "Revisions",
+                str(evaluation.get("revision_count", out.get("revision_count", 0))),
+            )
+
+            st.divider()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Word Count", evaluation.get("word_count", "N/A"))
+            c2.metric("Target Words", evaluation.get("target_word_count", "N/A"))
+            c3.metric(
+                "Invalid Citations",
+                evaluation.get(
+                    "invalid_citation_count", out.get("invalid_citation_count", 0)
+                ),
+            )
+            c4.metric(
+                "Errors", evaluation.get("error_count", len(out.get("errors") or []))
+            )
+
+            if evaluation:
+                with st.expander("Evaluation report", expanded=True):
+                    st.json(evaluation)
+
+            st.subheader("Fact Checker")
+            claims = fc.get("claims") or []
+            if claims:
+                claim_rows = []
+                for c in claims:
+                    claim_rows.append(
+                        {
+                            "claim_id": c.get("claim_id"),
+                            "verdict": c.get("verdict"),
+                            "citation_present": c.get("citation_present"),
+                            "evidence_ids": ", ".join(c.get("evidence_ids") or []),
+                            "confidence": c.get("confidence"),
+                            "claim": c.get("claim"),
+                            "reason": c.get("reason"),
+                        }
+                    )
+                st.dataframe(pd.DataFrame(claim_rows), width="stretch", hide_index=True)
+            elif fc.get("error"):
+                st.warning(f"Fact checker failed: {fc['error']}")
+            else:
+                st.info("No verifiable claims were returned by the fact checker.")
+
+            if out.get("errors"):
+                st.subheader("Recoverable / Recorded Errors")
+                st.dataframe(
+                    pd.DataFrame(out.get("errors")), width="stretch", hide_index=True
+                )
+
+        # --- Preview tab ---
+        with tab_preview:
+            st.subheader("Markdown Preview")
+            revisions = out.get("revision_count", 0)
+            if revisions > 0:
+                st.success(
+                    f"✨ The Agent editor critiqued and revised this draft **{revisions}** times to meet quality standards."
+                )
+                with st.expander("Latest Editor Feedback"):
+                    st.markdown(
+                        f"*{out.get('critique_feedback', 'No feedback recorded.')}*"
+                    )
+
+            final_md = out.get("final") or ""
+            if not final_md:
+                st.warning("No final markdown found.")
+            else:
+                render_markdown_with_local_images(final_md)
+
+                plan_dict = out.get("plan") or {}
+                blog_title = plan_dict.get(
+                    "blog_title", extract_title_from_md(final_md, "blog")
+                )
+                md_filename = f"{safe_slug(blog_title)}.md"
+
+                st.download_button(
+                    "⬇️ Download Markdown",
+                    data=final_md.encode("utf-8"),
+                    file_name=md_filename,
+                    mime="text/markdown",
+                )
+
+                bundle = bundle_zip(final_md, md_filename, Path("images"))
+                st.download_button(
+                    "📦 Download Bundle (MD + images)",
+                    data=bundle,
+                    file_name=f"{safe_slug(blog_title)}_bundle.zip",
+                    mime="application/zip",
+                )
+
+        # --- Images tab ---
+        with tab_images:
+            st.subheader("Images")
+            specs = out.get("image_specs") or []
+            images_dir = Path("images")
+
+            if not specs and not images_dir.exists():
+                st.info("No images generated for this blog.")
+            else:
+                if specs:
+                    st.write("**Image plan:**")
+                    st.json(specs)
+
+                if images_dir.exists():
+                    files = [p for p in images_dir.iterdir() if p.is_file()]
+                    if not files:
+                        st.warning("images/ exists but is empty.")
+                    else:
+                        for p in sorted(files):
+                            st.image(str(p), caption=p.name, width="stretch")
+
+                    z = images_zip(images_dir)
+                    if z:
+                        st.download_button(
+                            "⬇️ Download Images (zip)",
+                            data=z,
+                            file_name="images.zip",
+                            mime="application/zip",
+                        )
+
+        # --- Logs tab ---
+        with tab_logs:
+            st.subheader("Logs")
+            if logs:
+                st.text_area("Event log", value="\n\n".join(logs[-120:]), height=520)
+            else:
+                errors = out.get("errors") or []
+                if errors:
+                    st.text_area(
+                        "Recorded workflow errors",
+                        value="\n\n".join(json.dumps(e, default=str) for e in errors),
+                        height=520,
+                    )
+                else:
+                    st.info("No event logs recorded in this Streamlit session.")

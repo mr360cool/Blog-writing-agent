@@ -1,0 +1,13 @@
+.env
+*.env
+.env.*
+.streamlit/secrets.toml
+.git
+myenv/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+experiments/
+images/
