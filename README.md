@@ -152,42 +152,6 @@ LANGSMITH_TRACING=false
 BLOG_AGENT_MODEL=gpt-4.1-mini
 ```
 
-### 3. Run locally with Docker Desktop
-
-```bash
-docker compose up --build
-```
-
-Open `http://localhost:8501`. Docker Compose starts both the app and PostgreSQL; PostgreSQL stores resumable LangGraph checkpoints. Stop the services with `docker compose down` (add `-v` only if you also want to delete the database volume).
-
-To run Streamlit directly instead, start PostgreSQL with `docker compose up -d postgres`, then run:
-
-```bash
-streamlit run final_frontend.py
-```
-
-The app falls back to in-memory checkpoints when `BLOG_AGENT_DB_URI` is not configured. In-memory checkpoints are not durable across restarts.
-
-## ☁️ Deploy on Streamlit Community Cloud
-
-1. Push this project to a GitHub repository. Keep the repository private if you do not want to publish the source; Streamlit Community Cloud can deploy from a repository you authorize.
-2. In Streamlit Community Cloud, create an app from that repository and set the app file to `final_frontend.py`.
-3. In the app's **Settings → Secrets**, add your keys as TOML:
-
-   ```toml
-   OPENAI_API_KEY = "your-openai-api-key"
-   TAVILY_API_KEY = "your-tavily-api-key"
-   BLOG_AGENT_MODEL = "gpt-4.1-mini"
-   LANGSMITH_TRACING = "false"
-   ```
-
-   `OPENAI_API_KEY` is required. `TAVILY_API_KEY` enables web research; LangSmith settings are optional. Do not add `.env` or `secrets.toml` to GitHub.
-4. Deploy and use the URL provided by Streamlit Community Cloud to share the app.
-
-Streamlit Community Cloud storage is ephemeral, so PostgreSQL checkpointing is in-memory unless you configure an external PostgreSQL service and set `BLOG_AGENT_DB_URI` in app secrets. Anyone who can use a publicly shared app can trigger model requests charged to your API account; review provider spending limits before sharing the link.
-
----
-
 ## 🛠️ Tech Stack
 
 - **Frameworks**: LangGraph, LangChain, Streamlit
