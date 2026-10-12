@@ -152,6 +152,11 @@ LANGSMITH_TRACING=false
 BLOG_AGENT_MODEL=gpt-4.1-mini
 ```
 
+### 3. Start the app
+```bash
+streamlit run final_frontend.py
+```
+
 ## 🛠️ Tech Stack
 
 - **Frameworks**: LangGraph, LangChain, Streamlit
